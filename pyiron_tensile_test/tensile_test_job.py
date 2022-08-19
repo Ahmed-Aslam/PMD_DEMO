@@ -7,18 +7,15 @@ from sklearn.linear_model import LinearRegression
 import requests
 from SPARQLWrapper import SPARQLWrapper, JSON
 import os
-import owncloud
 
 
 class TensileJob(PythonTemplateJob):
     def __init__(self, project, job_name):
         super(TensileJob, self).__init__(project, job_name)
-        self.input = DataContainer(table_name='input')
         self._experimental_json = None
         self._actual_data = None
         self._elast_min_ind = 0
         self._elast_max_ind = 0
-        self.output = DataContainer(table_name='output')
         self._endpoint = None
 
     @property
@@ -48,18 +45,18 @@ class TensileJob(PythonTemplateJob):
     def endpoint(self, url):
         self._endpoint = SPARQLWrapper(url)
 
-    def query_data_source(self, test_name='Tensile_Test'):
+    def query_data_source(self, test_name='tensile_test'):
         self.input.test_name = test_name
-        query = """
-        prefix onto-discovery: <https:materialdigital.de/discovery#>
-        prefix wikiba: <http://wikiba.se/ontology#>
-
-        SELECT ?t ?dt ?link
-        WHERE{
-            ?t a onto-discovery:%s. 
-            ?t onto-discovery:has_data_resource ?dt .
-            ?dt onto-discovery:downloadable_from ?link .
-        }""" % test_name
+        query =f"""
+        PREFIX pmdco: <https://material-digital.de/pmdco/>
+        PREFIX tt: <https://material-digital.de/pmdao/tensile-test/>
+        SELECT ?loc
+        WHERE {{
+        ?tt a tt:TensileTest .
+        ?dr pmdco:hasDataResourceLocation ?loc .
+        ?tt pmdco:hasDataResource ?dr .
+        ?tt pmdco:hasSuppliedIdentifier ?s .
+        }}"""
         self.endpoint.setQuery(query)
         self.endpoint.setReturnFormat(JSON)
         results = self.endpoint.query().convert()
@@ -71,12 +68,11 @@ class TensileJob(PythonTemplateJob):
                     header2column[v] = []
                 header2column[v] += [binding[v]['value']]
         _init_data_frame = pandas.DataFrame.from_dict(header2column)
-        return _init_data_frame['link'][0]
+        return _init_data_frame['loc'][0]
 
     def get_dataset(self, url):
-        try:
-            oc = owncloud.Client.from_public_link(url)
-            content = oc.get_file_contents('')
+        try:         
+            content = requests.get(url).content.decode()
             self.experimental_json = pandas.read_json(content)
         except Exception as err_msg:
             raise Exception(f"Error: {err_msg}.Download of the file unsuccessful!,")
@@ -86,18 +82,34 @@ class TensileJob(PythonTemplateJob):
         content = requests.get(url, headers={'PRIVATE-TOKEN': '{}'. format(os.environ['gitlab_token'])}).content
         self.experimental_json = pandas.read_json(content)
 
+    def converter_strain(self, array):
+        for ind,value in enumerate(array):
+            try:
+                array[ind] = float(value.replace(',', '.'))-0.0586 # this is to offset strain values to start from zero
+            except:
+                array[ind] = array[ind-1]
+        return np.array(array, dtype='float32')
+    
+    def converter_stress(self, array):
+        for ind,value in enumerate(array):
+            array[ind] = float(value.replace(',', '.'))
+        return np.array(array, dtype='float32')
+
     def extract_stress_strain(self):
-        datalist = self._experimental_json['test.series']['data']
-        fields_units = self._experimental_json['test.series']['fields']
+        datalist = self._experimental_json['dataseries'][-1]['data']
+        fields_units = self._experimental_json['dataseries'][-1]['fields']
         df_fields_units = pandas.DataFrame(fields_units, columns = ['fields', 'units']) 
         fields = list(df_fields_units['fields'])
         self._actual_data = pandas.DataFrame(datalist, columns = fields) 
-        self.input.strains = np.array(self._actual_data['Elongation_1'][:])
-        self.input.stresses = np.array(self._actual_data['Tensile Stress'][:])
-    
+        # values are started from iteration 2 to avoid negative strain
+        # values are until 947 iteration as there is fracture after that
+        self.input.strains = (self.converter_strain(np.array(self._actual_data['Extensometer elongation'][:])[2:947]))
+        self.input.stresses = self.converter(np.array(self._actual_data['Load'][:])[2:947])/120.6 # Area of specimen Zx1
+
     def get_linear_segment(self):
-        strain_0 = 0.0006
-        elastic_limit = 0.09
+        strain_0 = 0.00
+        #elastic_limit = 0.0009
+        elastic_limit = 0.001
         self._elast_min_ind = 0
         self._elast_max_ind = 0
         flag_init = 0
@@ -113,10 +125,10 @@ class TensileJob(PythonTemplateJob):
             i = i + 1
 
     def plot_stress_strain(self):
-        plt.xlabel('strain, %')
-        plt.ylabel('stress, MPa')
-        plt.xlim(-1,60)
-        plt.ylim(0,700)
+        plt.xlabel('Displacement, %')
+        plt.ylabel('Stress, GPa')
+        #plt.xlim(-1,60)
+        #plt.ylim(0,700)
         plt.plot(self.input.strains, self.input.stresses)
 
     def calc_elastic_modulus(self):
@@ -128,54 +140,49 @@ class TensileJob(PythonTemplateJob):
         _x = _x.reshape(-1, 1)
         _y = _y.reshape(-1, 1)
         lm.fit(_x, _y)
-        self.output.elastic_modulus = float(lm.coef_[0])/1000
-
-    def to_hdf(self):
-        hdf = self.project_hdf5
-        hdf['TYPE'] = str(type(self))
-        self.input.to_hdf(hdf=self.project_hdf5)
-        self.output.to_hdf(hdf=self.project_hdf5)
-
-    def from_hdf(self, hdf, group_name):
-        self.input.from_hdf(hdf=self.project_hdf5)
-        self.output.from_hdf(hdf=self.project_hdf5)
+        self.output.elastic_modulus = float(lm.coef_[0])
+    
 
     def run_static(self):
         self.calc_elastic_modulus()
         self.to_hdf()
         self.status.finished = True
 
-    def update_triple_store(self):
-        query = '''
-            prefix onto-discovery: <https:materialdigital.de/discovery#>
-            prefix wikiba: <http://wikiba.se/ontology#> 
-            INSERT DATA
-            { GRAPH <https:materialdigital.de/discovery#tt0> { <https:materialdigital.de/discovery#qv4>  wikiba:quantityAmount  %f } }
-        ''' % self.output.elastic_modulus
+    def update_triple_store(self, test_name="tensile_test"):
+        # get quantity value of tensile test
+        query = f"""
+        PREFIX pmdco: <https://material-digital.de/pmdco/>
+        PREFIX tt: <https://material-digital.de/pmdao/tensile-test/>
+        prefix wikiba: <http://wikiba.se/ontology#>
+        
+        INSERT {{tt:hasMeasuredModulusOfElasticity  wikiba:quantityAmount  "{self.output.elastic_modulus}" }}
+        
+        
+        WHERE {{
+            ?tt pmdco:hasSuppliedIdentifier "{test_name}" .
+        }}
+        """
         self.endpoint.setQuery(query)
         self.endpoint.method = 'POST'
         self.endpoint.query()
 
     def verify_update(self):
         query = """
-        prefix onto-discovery: <https:materialdigital.de/discovery#>
+        PREFIX pmdco: <https://material-digital.de/pmdco/>
+        PREFIX tt: <https://material-digital.de/pmdao/tensile-test/>
         prefix wikiba: <http://wikiba.se/ontology#>
 
-        SELECT ?t ?E 
+        SELECT ?tt ?o
         WHERE{
-
-        	?t a onto-discovery:Tensile_Test .
-          	?t onto-discovery:young_s_modulus  ?modulus .
-            ?modulus wikiba:quantityAmount ?E .
+           ?tt tt:hasMeasuredModulusOfElasticity ?o
 
         }
-
-        		"""
+        """
         self.endpoint.setQuery(query)
+        self.endpoint.method = 'GET'
         self.endpoint.setReturnFormat(JSON)
-
         results = self.endpoint.query().convert()
-
+        print(results)
         header2column = {}
         variables = results['head']['vars']
         for binding in results['results']['bindings']:
@@ -185,9 +192,11 @@ class TensileJob(PythonTemplateJob):
                 header2column[v] += [binding[v]['value']]
 
         df = pd.DataFrame.from_dict(header2column)
-        if abs(float(df['E'].values[-1]) - self.output.elastic_modulus)/self.output.elastic_modulus < 0.001:
-            print("correctly updated!")
-            return True
-        else:
-            print("the update was unsuccessful!")
-            return False
+        return(df)
+        #if abs(float(df['E'].values[-1]) - self.output.elastic_modulus)/self.output.elastic_modulus < 0.001:
+        #    print("correctly updated!")
+        #    return True
+        #else:
+        #    print("the update was unsuccessful!")
+        #    return False
+       
