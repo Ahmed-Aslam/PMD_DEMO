@@ -104,7 +104,7 @@ class TensileJob(PythonTemplateJob):
         # values are started from iteration 2 to avoid negative strain
         # values are until 947 iteration as there is fracture after that
         self.input.strains = (self.converter_strain(np.array(self._actual_data['Extensometer elongation'][:])[2:947]))
-        self.input.stresses = self.converter(np.array(self._actual_data['Load'][:])[2:947])/120.6 # Area of specimen Zx1
+        self.input.stresses = self.converter_stress(np.array(self._actual_data['Load'][:])[2:947])/120.6 # Area of specimen Zx1
 
     def get_linear_segment(self):
         strain_0 = 0.00
@@ -125,11 +125,12 @@ class TensileJob(PythonTemplateJob):
             i = i + 1
 
     def plot_stress_strain(self):
-        plt.xlabel('Displacement, %')
-        plt.ylabel('Stress, GPa')
-        #plt.xlim(-1,60)
-        #plt.ylim(0,700)
-        plt.plot(self.input.strains, self.input.stresses)
+        plt.xlabel('Displacement [%]')
+        plt.ylabel('Stress [GPa]')
+        plt.xlim(-0.01,1.9)
+        plt.ylim(-0.0001,.45)
+        plt.plot(self.input.strains, self.input.stresses, linewidth=4.0)
+        plt.savefig('Stress_Strain.jpg', dpi=500)
 
     def calc_elastic_modulus(self):
         self.get_linear_segment()
@@ -182,7 +183,7 @@ class TensileJob(PythonTemplateJob):
         self.endpoint.method = 'GET'
         self.endpoint.setReturnFormat(JSON)
         results = self.endpoint.query().convert()
-        print(results)
+        #print(results)
         header2column = {}
         variables = results['head']['vars']
         for binding in results['results']['bindings']:
@@ -192,7 +193,7 @@ class TensileJob(PythonTemplateJob):
                 header2column[v] += [binding[v]['value']]
 
         df = pd.DataFrame.from_dict(header2column)
-        return(df)
+        #return(df)
         #if abs(float(df['E'].values[-1]) - self.output.elastic_modulus)/self.output.elastic_modulus < 0.001:
         #    print("correctly updated!")
         #    return True
